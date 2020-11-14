@@ -31,7 +31,6 @@ use std::time::Duration;
 use std::u64;
 use stopwatch::Stopwatch;
 use tokio::prelude::*;
-use tokio::runtime::TaskExecutor;
 
 pub struct Miner {
     reader: Reader,
@@ -42,7 +41,6 @@ pub struct Miner {
     state: Arc<Mutex<State>>,
     reader_task_count: usize,
     get_mining_info_interval: u64,
-    executor: TaskExecutor,
     wakeup_after: i64,
 }
 
@@ -226,7 +224,7 @@ fn scan_plots(
 }
 
 impl Miner {
-    pub fn new(cfg: Cfg, executor: TaskExecutor) -> Miner {
+    pub fn new(cfg: Cfg) -> Miner {
         let (drive_id_to_plots, total_size) =
             scan_plots(&cfg.plot_dirs, cfg.hdd_use_direct_io, cfg.benchmark_cpu());
 
@@ -442,12 +440,10 @@ impl Miner {
                 (total_size * 4 / 1024 / 1024) as usize,
                 cfg.send_proxy_details,
                 cfg.additional_headers,
-                executor.clone(),
             ),
             state: Arc::new(Mutex::new(State::new())),
             // floor at 1s to protect servers
             get_mining_info_interval: max(1000, cfg.get_mining_info_interval),
-            executor,
             wakeup_after: cfg.hdd_wakeup_after * 1000, // ms -> s
         }
     }

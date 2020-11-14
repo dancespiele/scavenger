@@ -5,14 +5,13 @@
 //! consecutively.
 //! New items will replace old items and start with a delay of 0.
 
-use futures::stream::{Fuse, Stream};
-use futures::{Async, Future, Poll};
 use std::time::{Duration, Instant};
-use tokio::timer::{self, Delay};
+use tokio::time::{sleep, Sleep};
+use tokio::stream::{Stream, StreamExt, fuse::Fuse};
 
 struct DelayedItem<Item> {
     attempt: u32,
-    delay: Option<Delay>,
+    delay: Option<Sleep>,
     value: Item,
 }
 
@@ -27,7 +26,7 @@ impl<Item> DelayedItem<Item> {
 
     fn exp_backoff(&mut self, delay: Duration) {
         let backoff = 2u32.pow(self.attempt) * delay;
-        self.delay = Some(Delay::new(Instant::now() + backoff));
+        self.delay = Some(sleep(Instant::now() + backoff));
         self.attempt += 1;
     }
 
@@ -71,7 +70,7 @@ enum Kind<T> {
     Inner(T),
 
     /// Timer returned an error.
-    Timer(timer::Error),
+    Timer(time::error::Error),
 }
 
 impl<S> Stream for PrioRetry<S>

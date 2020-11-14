@@ -31,9 +31,7 @@ mod ocl;
 use crate::config::load_cfg;
 use crate::miner::Miner;
 use clap::{App, Arg};
-use futures::Future;
 use std::process;
-use tokio::runtime::Builder;
 
 cfg_if! {
     if #[cfg(feature = "simd")] {
@@ -96,6 +94,7 @@ cfg_if! {
     }
 }
 
+#[tokio::main]
 fn main() {
     let arg = App::new("Scavenger - a PoC miner")
         .version(crate_version!())
@@ -140,8 +139,6 @@ fn main() {
     #[cfg(feature = "opencl")]
     ocl::gpu_info(&cfg_loaded);
 
-    let rt = Builder::new().core_threads(1).build().unwrap();
-    let m = Miner::new(cfg_loaded, rt.executor());
+    let m = Miner::new(cfg_loaded);
     m.run();
-    rt.shutdown_on_idle().wait().unwrap();
 }

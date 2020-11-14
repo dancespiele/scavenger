@@ -8,8 +8,6 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::time::Duration;
 use std::u64;
-use tokio;
-use tokio::runtime::TaskExecutor;
 use url::Url;
 
 #[derive(Clone)]
@@ -26,7 +24,6 @@ impl RequestHandler {
         total_size_gb: usize,
         send_proxy_details: bool,
         additional_headers: HashMap<String, String>,
-        executor: TaskExecutor,
     ) -> RequestHandler {
         // TODO
         let proxy_details = if send_proxy_details {
@@ -49,7 +46,6 @@ impl RequestHandler {
             client.clone(),
             rx_submit_nonce_data,
             tx_submit_data.clone(),
-            executor,
         );
 
         RequestHandler {
@@ -58,14 +54,12 @@ impl RequestHandler {
         }
     }
 
-    fn handle_submissions(
+    async fn handle_submissions(
         client: Client,
         rx: mpsc::UnboundedReceiver<SubmissionParameters>,
         tx_submit_data: mpsc::UnboundedSender<SubmissionParameters>,
-        executor: TaskExecutor,
     ) {
-        let stream = PrioRetry::new(rx, Duration::from_secs(3))
-            .and_then(move |submission_params| {
+        let stream = rx
                 let tx_submit_data = tx_submit_data.clone();
                 client
                     .clone()

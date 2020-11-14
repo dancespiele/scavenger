@@ -19,38 +19,39 @@ neon = []
 opencl = ["ocl-core"]
 
 [dependencies]
-cfg-if = "0.1"
-clap = "~2.30"
-core_affinity = "0.5.9"
-crossbeam-channel = "0.3"
+cfg-if = "1.0"
+clap = "~2.33"
+core_affinity = "0.5.10"
+crossbeam-channel = "0.5"
 filetime = "0.2"
-futures = "0.1"
-hex = "0.3"
-hostname = "0.1.5"
+futures = "0.3"
+hex = "0.4"
+hostname = "0.3.1"
 libc = "0.2"
 log = "0.4"
-log4rs = { version = "0.8", features = ["rolling_file_appender", "compound_policy", "size_trigger", "fixed_window_roller"] }
-num_cpus = "1.9"
-ocl-core = { version = "0.11.1", optional = true } 
-pbr = "1.0.1"
-rand = "0.6"
-rayon = "1.0"
+log4rs = { version = "0.13", features = ["rolling_file_appender", "compound_policy", "size_trigger", "fixed_window_roller"] }
+num_cpus = "1.13"
+ocl-core = { version = "0.11.2", optional = true } 
+pbr = "1.0.3"
+rand = "0.7.3"
+rayon = "1.5"
 serde = "1.0"
 serde_derive = "1.0"
 serde_json = "1.0"
 serde_yaml = "0.8"
 stopwatch = "0.0.7"
-tokio = "0.1"
-url = "1.7"
-page_size = "0.4.1"
+tokio = { version="0.3", features=["time", "stream"]}
+url = "2.2.0"
+page_size = "0.4.2"
 aligned_alloc = "0.1"
-reqwest = { version = "0.9.9", default-features = false, features = ["rustls-tls"] }
-bytes = "0.4.11"
+reqwest = { version = "0.10.8", default-features = false, features = ["rustls-tls"] }
+bytes = "0.6.0"
 url_serde = "0.2"
+async-trait= "0.1"
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["fileapi"] }
 
 [build-dependencies]
 cc = "1.0"
-cfg-if = "0.1"
+cfg-if = "1.0"

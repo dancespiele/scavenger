@@ -1,6 +1,4 @@
-use bytes::Buf;
-use reqwest::r#async::Chunk;
-use serde::de::{self, DeserializeOwned};
+use serde::de;
 use std::fmt;
 
 #[derive(Clone, Debug, Serialize)]
@@ -105,18 +103,3 @@ where
     deserializer.deserialize_any(StringOrIntVisitor)
 }
 
-pub fn parse_json_result<T: DeserializeOwned>(body: &Chunk) -> Result<T, PoolError> {
-    match serde_json::from_slice(body.bytes()) {
-        Ok(x) => Ok(x),
-        _ => match serde_json::from_slice::<PoolErrorWrapper>(body.bytes()) {
-            Ok(x) => Err(x.error),
-            _ => {
-                let v = body.to_vec();
-                Err(PoolError {
-                    code: 0,
-                    message: String::from_utf8_lossy(&v).to_string(),
-                })
-            }
-        },
-    }
-}

@@ -2,8 +2,8 @@ use crate::miner::{Buffer, NonceData};
 use crate::poc_hashing::find_best_deadline_rust;
 use crate::reader::ReadReply;
 use crossbeam_channel::{Receiver, Sender};
-use futures::sync::mpsc;
-use futures::{Future, Sink};
+use tokio::sync::mpsc;
+use futures::TryFutureExt;
 #[cfg(any(feature = "simd", feature = "neon"))]
 use libc::{c_void, uint64_t};
 use std::u64;
@@ -64,7 +64,7 @@ pub fn create_cpu_worker_task(
     benchmark: bool,
     thread_pool: rayon::ThreadPool,
     rx_read_replies: Receiver<ReadReply>,
-    tx_empty_buffers: Sender<Box<Buffer + Send>>,
+    tx_empty_buffers: Sender<Box<dyn Buffer + Send>>,
     tx_nonce_data: mpsc::Sender<NonceData>,
 ) -> impl FnOnce() {
     move || {
@@ -83,7 +83,7 @@ pub fn create_cpu_worker_task(
 
 pub fn hash(
     read_reply: ReadReply,
-    tx_empty_buffers: Sender<Box<Buffer + Send>>,
+    tx_empty_buffers: Sender<Box<dyn Buffer + Send>>,
     tx_nonce_data: mpsc::Sender<NonceData>,
     benchmark: bool,
 ) -> impl FnOnce() {
@@ -105,8 +105,9 @@ pub fn hash(
                         reader_task_processed: read_reply.info.finished,
                         account_id: read_reply.info.account_id,
                     })
-                    .wait()
-                    .expect("CPU worker failed to send nonce data");
+                    .unwrap_or_else(|err| {
+                        eprintln!("{}", err)
+                    });
             }
             tx_empty_buffers
                 .send(buffer)
@@ -218,8 +219,9 @@ pub fn hash(
                 reader_task_processed: read_reply.info.finished,
                 account_id: read_reply.info.account_id,
             })
-            .wait()
-            .expect("CPU worker failed to send nonce data");
+            .unwrap_or_else(|err| {
+                eprintln!("{}", err)
+            });
         tx_empty_buffers
             .send(buffer)
             .expect("CPU worker failed to cue empty buffer");

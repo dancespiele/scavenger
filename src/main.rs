@@ -11,7 +11,6 @@ extern crate log;
 mod com;
 mod config;
 mod cpu_worker;
-mod future;
 mod logger;
 mod miner;
 mod plot;
@@ -95,7 +94,7 @@ cfg_if! {
 }
 
 #[tokio::main]
-fn main() {
+async fn main() {
     let arg = App::new("Scavenger - a PoC miner")
         .version(crate_version!())
         .author(crate_authors!())

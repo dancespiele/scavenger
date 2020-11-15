@@ -1,13 +1,11 @@
 use crate::com::api::*;
-use futures::stream::Stream;
-use futures::Future;
 use reqwest::header::{HeaderMap, HeaderName};
-use reqwest::r#async::{Client as InnerClient, ClientBuilder, Decoder};
+use reqwest::{Client as InnerClient, ClientBuilder};
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::mem;
 use std::sync::Arc;
 use std::time::Duration;
+use std::ffi::OsString;
 use url::form_urlencoded::byte_serialize;
 use url::Url;
 
@@ -91,15 +89,17 @@ impl Client {
             headers.insert("X-Miner", ua.to_owned().parse().unwrap());
             headers.insert(
                 "X-Minername",
-                hostname::get_hostname()
-                    .unwrap_or_else(|| "".to_owned())
+                hostname::get()
+                    .unwrap_or_else(|_err| OsString::from(""))
+                    .into_string()
+                    .unwrap()
                     .parse()
                     .unwrap(),
             );
             headers.insert(
                 "X-Plotfile",
                 ("ScavengerProxy/".to_owned()
-                    + &*hostname::get_hostname().unwrap_or_else(|| "".to_owned()))
+                    + &*hostname::get().unwrap_or_else(|_err| OsString::from("")).into_string().unwrap())
                     .parse()
                     .unwrap(),
             );
@@ -144,7 +144,7 @@ impl Client {
     }
 
     /// Get current mining info.
-    pub fn get_mining_info(&self) -> impl Future<Item = MiningInfoResponse, Error = FetchError> {
+    pub async fn get_mining_info(&self) -> Result<MiningInfoResponse, FetchError> {
         self.inner
             .get(self.uri_for("burst"))
             .headers((*self.headers).clone())
@@ -152,15 +152,10 @@ impl Client {
                 request_type: &"getMiningInfo",
             })
             .send()
-            .and_then(|mut res| {
-                let body = mem::replace(res.body_mut(), Decoder::empty());
-                body.concat2()
-            })
-            .from_err::<FetchError>()
-            .and_then(|body| match parse_json_result(&body) {
-                Ok(x) => Ok(x),
-                Err(e) => Err(e.into()),
-            })
+            .await?
+            .json::<MiningInfoResponse>()
+            .await
+            .or_else(|err| Err(FetchError::Http(err)))
     }
 
     pub fn uri_for(&self, path: &str) -> Url {
@@ -174,10 +169,10 @@ impl Client {
     }
 
     /// Submit nonce to the pool and get the corresponding deadline.
-    pub fn submit_nonce(
+    pub async fn submit_nonce(
         &self,
         submission_data: &SubmissionParameters,
-    ) -> impl Future<Item = SubmitNonceResponse, Error = FetchError> {
+    ) -> Result<SubmitNonceResponse, FetchError>{
         let secret_phrase = self
             .account_id_to_secret_phrase
             .get(&submission_data.account_id);
@@ -215,15 +210,10 @@ impl Client {
             .headers(headers)
             .query(&query)
             .send()
-            .and_then(|mut res| {
-                let body = mem::replace(res.body_mut(), Decoder::empty());
-                body.concat2()
-            })
-            .from_err::<FetchError>()
-            .and_then(|body| match parse_json_result(&body) {
-                Ok(x) => Ok(x),
-                Err(e) => Err(e.into()),
-            })
+            .await?
+            .json::<SubmitNonceResponse>()
+            .await
+            .or_else(|err| Err(FetchError::Http(err)))
     }
 }
 

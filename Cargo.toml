@@ -41,7 +41,7 @@ serde_json = "1.0"
 serde_yaml = "0.8"
 stopwatch = "0.0.7"
 tokio = { version="0.3", features=["time", "stream", "sync", "rt-multi-thread", "macros"]}
-url = "2.2.0"
+url = {version = "2.2.0", features = ["serde"]}
 page_size = "0.4.2"
 aligned_alloc = "0.1"
 reqwest = { version = "0.10.8", default-features = false, features = ["rustls-tls", "json"] }

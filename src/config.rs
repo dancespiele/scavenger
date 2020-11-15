@@ -5,21 +5,20 @@ use std::path::PathBuf;
 use std::u32;
 use url::Url;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub enum Benchmark {
     IO,
     XPU,
     Disabled,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Cfg {
     #[serde(default = "default_secret_phrase")]
     pub account_id_to_secret_phrase: HashMap<u64, String>,
 
     pub plot_dirs: Vec<PathBuf>,
 
-    #[serde(with = "url_serde")]
     pub url: Url,
 
     #[serde(default = "default_hdd_reader_thread_count")]

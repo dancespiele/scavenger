@@ -138,6 +138,6 @@ async fn main() {
     #[cfg(feature = "opencl")]
     ocl::gpu_info(&cfg_loaded);
 
-    let m = Miner::new(cfg_loaded);
-    m.run();
+    let m = Miner::new(cfg_loaded).await;
+    m.run().await;
 }

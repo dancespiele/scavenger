@@ -13,7 +13,7 @@ pub struct RequestHandler {
 }
 
 impl RequestHandler {
-    pub fn new(
+    pub async fn new(
         base_uri: Url,
         secret_phrases: HashMap<u64, String>,
         timeout: u64,
@@ -42,7 +42,7 @@ impl RequestHandler {
             client.clone(),
             rx_submit_nonce_data,
             tx_submit_data.clone(),
-        );
+        ).await;
 
         RequestHandler {
             client,
@@ -209,7 +209,7 @@ async fn test_submit_nonce() {
         12,
         true,
         HashMap::new(),
-    );
+    ).await;
 
     request_handler.submit_nonce(1337, 12, 111, 0, 7123, 1193, [0; 32]);
 

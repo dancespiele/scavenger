@@ -3,14 +3,15 @@ use crate::miner::Buffer;
 use crate::miner::CpuBuffer;
 use crate::plot::{Meta, Plot};
 use crate::utils::new_thread_pool;
-use crossbeam_channel;
-use crossbeam_channel::{Receiver, Sender};
 use pbr::{ProgressBar, Units};
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::io::Stdout;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use stopwatch::Stopwatch;
+use tokio::stream::{self, StreamExt};
+use tokio::sync::mpsc::{unbounded_channel, Sender};
+use tokio::sync::Mutex;
 
 pub struct BufferInfo {
     pub len: usize,
@@ -152,8 +153,8 @@ impl Reader {
     pub fn wakeup(&mut self) {
         for plots in self.drive_id_to_plots.values() {
             let plots = plots.clone();
-            self.pool.spawn(move || {
-                let mut p = plots[0].lock().unwrap();
+            tokio::spawn(async {
+                let mut p = plots[0].lock().await;
 
                 if let Err(e) = p.seek_random() {
                     error!(
@@ -165,7 +166,7 @@ impl Reader {
         }
     }
 
-    fn create_read_task(
+    async fn create_read_task(
         &self,
         pb: Option<Arc<Mutex<pbr::ProgressBar<Stdout>>>>,
         drive: String,
@@ -177,176 +178,175 @@ impl Reader {
         gensig: Arc<[u8; 32]>,
         show_drive_stats: bool,
     ) -> (Sender<()>, impl FnOnce()) {
-        let (tx_interupt, rx_interupt) = crossbeam_channel::unbounded();
+        let (tx_interupt, rx_interupt) = unbounded_channel();
         let rx_empty_buffers = self.rx_empty_buffers.clone();
         let tx_empty_buffers = self.tx_empty_buffers.clone();
         let tx_read_replies_cpu = self.tx_read_replies_cpu.clone();
         #[cfg(feature = "opencl")]
         let tx_read_replies_gpu = self.tx_read_replies_gpu.clone();
 
-        (tx_interupt, move || {
-            let mut sw = Stopwatch::new();
-            let mut elapsed = 0i64;
-            let mut nonces_processed = 0u64;
-            let plot_count = plots.len();
-            'outer: for (i_p, p) in plots.iter().enumerate() {
-                let mut p = p.lock().unwrap();
-                if let Err(e) = p.prepare(scoop) {
-                    error!(
-                        "reader: error preparing {} for reading: {} -> skip one round",
-                        p.meta.name, e
-                    );
-                    continue 'outer;
-                }
+        let mut sw = Stopwatch::new();
+        let mut elapsed = 0i64;
+        let mut nonces_processed = 0u64;
+        let plot_count = plots.len();
+        plots.iter().enumerate().for_each(|i_p, p| async {
+            let mut p = p.lock().await;
+            if let Err(e) = p.prepare(scoop) {
+                error!(
+                    "reader: error preparing {} for reading: {} -> skip one round",
+                    p.meta.name, e
+                );
 
-                'inner: for mut buffer in rx_empty_buffers.clone() {
-                    if show_drive_stats {
-                        sw.restart();
-                    }
-                    let mut_bs = buffer.get_buffer_for_writing();
-                    let mut bs = mut_bs.lock().unwrap();
-                    let (bytes_read, start_nonce, next_plot) = match p.read(&mut bs, scoop) {
-                        Ok(x) => x,
-                        Err(e) => {
-                            error!(
-                                "reader: error reading chunk from {}: {} -> skip one round",
-                                p.meta.name, e
-                            );
-                            buffer.unmap();
-                            (0, 0, true)
-                        }
-                    };
-
-                    if rx_interupt.try_recv().is_ok() {
-                        buffer.unmap();
-                        tx_empty_buffers.send(buffer).unwrap();
-                        break 'outer;
-                    }
-
-                    let finished = i_p == (plot_count - 1) && next_plot;
-                    // buffer routing
-                    #[cfg(feature = "opencl")]
-                    match buffer.get_id() {
-                        0 => {
-                            tx_read_replies_cpu
-                                .send(ReadReply {
-                                    buffer,
-                                    info: BufferInfo {
-                                        len: bytes_read,
-                                        height,
-                                        block,
-                                        base_target,
-                                        gensig: gensig.clone(),
-                                        start_nonce,
-                                        finished,
-                                        account_id: p.meta.account_id,
-                                        gpu_signal: 0,
-                                    },
-                                })
-                                .expect("failed to send read data to CPU thread");
-                        }
-                        i => {
-                            tx_read_replies_gpu.as_ref().unwrap()[i - 1]
-                                .send(ReadReply {
-                                    buffer,
-                                    info: BufferInfo {
-                                        len: bytes_read,
-                                        height,
-                                        block,
-                                        base_target,
-                                        gensig: gensig.clone(),
-                                        start_nonce,
-                                        finished,
-                                        account_id: p.meta.account_id,
-                                        gpu_signal: 0,
-                                    },
-                                })
-                                .expect("failed to send read data to GPU thread A");
-                        }
-                    }
-                    #[cfg(not(feature = "opencl"))]
-                    tx_read_replies_cpu
-                        .send(ReadReply {
-                            buffer,
-                            info: BufferInfo {
-                                len: bytes_read,
-                                height,
-                                block,
-                                base_target,
-                                gensig: gensig.clone(),
-                                start_nonce,
-                                finished,
-                                account_id: p.meta.account_id,
-                                gpu_signal: 0,
-                            },
-                        })
-                        .unwrap();
-
-                    nonces_processed += bytes_read as u64 / 64;
-
-                    match &pb {
-                        Some(pb) => {
-                            let mut pb = pb.lock().unwrap();
-                            pb.add(bytes_read as u64);
-                        }
-                        None => (),
-                    }
-
-                    if show_drive_stats {
-                        elapsed += sw.elapsed_ms();
-                    }
-
-                    // send termination signal (dummy buffer) to gpu
-                    if finished {
-                        #[cfg(feature = "opencl")]
-                        for i in 0..tx_read_replies_gpu.as_ref().unwrap().len() {
-                            tx_read_replies_gpu.as_ref().unwrap()[i]
-                                .send(ReadReply {
-                                    buffer: Box::new(CpuBuffer::new(0)) as Box<Buffer + Send>,
-                                    info: BufferInfo {
-                                        len: 1,
-                                        height,
-                                        block,
-                                        base_target,
-                                        gensig: gensig.clone(),
-                                        start_nonce: 0,
-                                        finished: false,
-                                        account_id: 0,
-                                        gpu_signal: 2,
-                                    },
-                                })
-                                .expect("Error sending 'drive finished' signal to GPU thread A");
-                        }
-                    }
-
-                    if finished && show_drive_stats {
-                        info!(
-                            "{: <80}",
-                            format!(
-                                "drive {} finished, speed={} MiB/s",
-                                drive,
-                                nonces_processed * 1000 / (elapsed + 1) as u64 * 64 / 1024 / 1024,
-                            )
-                        );
-                    }
-
-                    if next_plot {
-                        break 'inner;
-                    }
-                }
+                return;
             }
+
+            rx_empty_buffers.clone().for_each(|buffer| {
+                if show_drive_stats {
+                    sw.restart();
+                }
+                let mut_bs = buffer.get_buffer_for_writing();
+                let mut bs = mut_bs.lock().await;
+                let (bytes_read, start_nonce, next_plot) = match p.read(&mut bs, scoop) {
+                    Ok(x) => x,
+                    Err(e) => {
+                        error!(
+                            "reader: error reading chunk from {}: {} -> skip one round",
+                            p.meta.name, e
+                        );
+                        buffer.unmap();
+                        (0, 0, true)
+                    }
+                };
+
+                if rx_interupt.try_recv().is_ok() {
+                    buffer.unmap();
+                    tx_empty_buffers.send(buffer).unwrap();
+                    break 'outer;
+                }
+
+                let finished = i_p == (plot_count - 1) && next_plot;
+                // buffer routing
+                #[cfg(feature = "opencl")]
+                match buffer.get_id() {
+                    0 => {
+                        tx_read_replies_cpu
+                            .send(ReadReply {
+                                buffer,
+                                info: BufferInfo {
+                                    len: bytes_read,
+                                    height,
+                                    block,
+                                    base_target,
+                                    gensig: gensig.clone(),
+                                    start_nonce,
+                                    finished,
+                                    account_id: p.meta.account_id,
+                                    gpu_signal: 0,
+                                },
+                            })
+                            .expect("failed to send read data to CPU thread");
+                    }
+                    i => {
+                        tx_read_replies_gpu.as_ref().unwrap()[i - 1]
+                            .send(ReadReply {
+                                buffer,
+                                info: BufferInfo {
+                                    len: bytes_read,
+                                    height,
+                                    block,
+                                    base_target,
+                                    gensig: gensig.clone(),
+                                    start_nonce,
+                                    finished,
+                                    account_id: p.meta.account_id,
+                                    gpu_signal: 0,
+                                },
+                            })
+                            .expect("failed to send read data to GPU thread A");
+                    }
+                }
+                #[cfg(not(feature = "opencl"))]
+                tx_read_replies_cpu
+                    .send(ReadReply {
+                        buffer,
+                        info: BufferInfo {
+                            len: bytes_read,
+                            height,
+                            block,
+                            base_target,
+                            gensig: gensig.clone(),
+                            start_nonce,
+                            finished,
+                            account_id: p.meta.account_id,
+                            gpu_signal: 0,
+                        },
+                    })
+                    .unwrap();
+
+                nonces_processed += bytes_read as u64 / 64;
+
+                match &pb {
+                    Some(pb) => {
+                        let mut pb = pb.lock().await;
+                        pb.add(bytes_read as u64);
+                    }
+                    None => (),
+                }
+
+                if show_drive_stats {
+                    elapsed += sw.elapsed_ms();
+                }
+
+                // send termination signal (dummy buffer) to gpu
+                if finished {
+                    #[cfg(feature = "opencl")]
+                    for i in 0..tx_read_replies_gpu.as_ref().unwrap().len() {
+                        tx_read_replies_gpu.as_ref().unwrap()[i]
+                            .send(ReadReply {
+                                buffer: Box::new(CpuBuffer::new(0)) as Box<Buffer + Send>,
+                                info: BufferInfo {
+                                    len: 1,
+                                    height,
+                                    block,
+                                    base_target,
+                                    gensig: gensig.clone(),
+                                    start_nonce: 0,
+                                    finished: false,
+                                    account_id: 0,
+                                    gpu_signal: 2,
+                                },
+                            })
+                            .expect("Error sending 'drive finished' signal to GPU thread A");
+                    }
+                }
+
+                if finished && show_drive_stats {
+                    info!(
+                        "{: <80}",
+                        format!(
+                            "drive {} finished, speed={} MiB/s",
+                            drive,
+                            nonces_processed * 1000 / (elapsed + 1) as u64 * 64 / 1024 / 1024,
+                        )
+                    );
+                }
+
+                if next_plot {
+                    break;
+                }
+            })
         })
     }
 }
 
 // Don't waste your time striving for perfection; instead, strive for excellence - doing your best.
 // let my_best = perfection;
-pub fn check_overlap(drive_id_to_plots: &HashMap<String, Arc<Vec<Mutex<Plot>>>>) -> bool {
+pub async fn check_overlap(drive_id_to_plots: &HashMap<String, Arc<Vec<Mutex<Plot>>>>) -> bool {
     let plots: Vec<Meta> = drive_id_to_plots
         .values()
         .map(|a| a.iter())
         .flatten()
-        .map(|plot| plot.lock().unwrap().meta.clone())
+        .map(|plot| plot.lock().await.meta.clone())
         .collect();
     plots
         .par_iter()

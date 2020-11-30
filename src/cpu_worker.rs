@@ -2,11 +2,11 @@ use crate::miner::{Buffer, NonceData};
 use crate::poc_hashing::find_best_deadline_rust;
 use crate::reader::ReadReply;
 use crossbeam_channel::{Receiver, Sender};
-use tokio::sync::mpsc;
 use futures::FutureExt;
 #[cfg(any(feature = "simd", feature = "neon"))]
 use libc::{c_void, uint64_t};
 use std::u64;
+use tokio::sync::mpsc;
 
 cfg_if! {
     if #[cfg(feature = "simd")] {
@@ -60,143 +60,105 @@ cfg_if! {
     }
 }
 
-pub fn create_cpu_worker_task(
+pub async fn create_cpu_worker_task(
     benchmark: bool,
-    thread_pool: rayon::ThreadPool,
     rx_read_replies: Receiver<ReadReply>,
     tx_empty_buffers: Sender<Box<dyn Buffer + Send>>,
     tx_nonce_data: mpsc::Sender<NonceData>,
-) -> impl FnOnce() {
-    move || {
-        for read_reply in rx_read_replies {
-            let task = hash(
-                read_reply,
-                tx_empty_buffers.clone(),
-                tx_nonce_data.clone(),
-                benchmark,
-            );
-
-            thread_pool.spawn(task);
-        }
+) {
+    for read_reply in rx_read_replies {
+        let task = hash(
+            read_reply,
+            tx_empty_buffers.clone(),
+            tx_nonce_data.clone(),
+            benchmark,
+        )
+        .await;
     }
 }
 
-pub fn hash(
+pub async fn hash(
     read_reply: ReadReply,
     tx_empty_buffers: Sender<Box<dyn Buffer + Send>>,
     tx_nonce_data: mpsc::Sender<NonceData>,
     benchmark: bool,
-) -> impl FnOnce() {
-    move || {
-        let mut buffer = read_reply.buffer;
-        // handle empty buffers (read errors) && benchmark
-        if read_reply.info.len == 0 || benchmark {
-            // forward 'drive finished signal'
-            if read_reply.info.finished {
-                let deadline = u64::MAX;
-                tx_nonce_data
-                    .clone()
-                    .send(NonceData {
-                        height: read_reply.info.height,
-                        block: read_reply.info.block,
-                        base_target: read_reply.info.base_target,
-                        deadline,
-                        nonce: 0,
-                        reader_task_processed: read_reply.info.finished,
-                        account_id: read_reply.info.account_id,
-                    })
-                    .now_or_never();
-            }
-            tx_empty_buffers
-                .send(buffer)
-                .expect("CPU worker failed to pass through buffer.");
-            return;
+) {
+    let mut buffer = read_reply.buffer;
+    // handle empty buffers (read errors) && benchmark
+    if read_reply.info.len == 0 || benchmark {
+        // forward 'drive finished signal'
+        if read_reply.info.finished {
+            let deadline = u64::MAX;
+            tx_nonce_data
+                .clone()
+                .send(NonceData {
+                    height: read_reply.info.height,
+                    block: read_reply.info.block,
+                    base_target: read_reply.info.base_target,
+                    deadline,
+                    nonce: 0,
+                    reader_task_processed: read_reply.info.finished,
+                    account_id: read_reply.info.account_id,
+                })
+                .await
+                .unwrap_or_else(|_| {
+                    eprintln!("CPU worker failed to send nonce data");
+                });
         }
+        tx_empty_buffers
+            .send(buffer)
+            .expect("CPU worker failed to pass through buffer.");
+        return;
+    }
 
-        // ignore signals
-        if read_reply.info.len == 1 && read_reply.info.gpu_signal > 0 {
-            return;
-        }
+    // ignore signals
+    if read_reply.info.len == 1 && read_reply.info.gpu_signal > 0 {
+        return;
+    }
 
-        #[allow(unused_assignments)]
-        let mut deadline: u64 = u64::MAX;
-        #[allow(unused_assignments)]
-        let mut offset: u64 = 0;
+    #[allow(unused_assignments)]
+    let mut deadline: u64 = u64::MAX;
+    #[allow(unused_assignments)]
+    let mut offset: u64 = 0;
 
-        let bs = buffer.get_buffer_for_writing();
-        let bs = bs.lock().unwrap();
+    let bs = buffer.get_buffer_for_writing();
+    let bs = bs.lock().await;
 
-        #[cfg(feature = "simd")]
-        unsafe {
-            if is_x86_feature_detected!("avx512f") {
-                find_best_deadline_avx512f(
-                    bs.as_ptr() as *mut c_void,
-                    (read_reply.info.len as u64) / 64,
-                    read_reply.info.gensig.as_ptr() as *const c_void,
-                    &mut deadline,
-                    &mut offset,
-                );
-            } else if is_x86_feature_detected!("avx2") {
-                find_best_deadline_avx2(
-                    bs.as_ptr() as *mut c_void,
-                    (read_reply.info.len as u64) / 64,
-                    read_reply.info.gensig.as_ptr() as *const c_void,
-                    &mut deadline,
-                    &mut offset,
-                );
-            } else if is_x86_feature_detected!("avx") {
-                find_best_deadline_avx(
-                    bs.as_ptr() as *mut c_void,
-                    (read_reply.info.len as u64) / 64,
-                    read_reply.info.gensig.as_ptr() as *const c_void,
-                    &mut deadline,
-                    &mut offset,
-                );
-            } else if is_x86_feature_detected!("sse2") {
-                find_best_deadline_sse2(
-                    bs.as_ptr() as *mut c_void,
-                    (read_reply.info.len as u64) / 64,
-                    read_reply.info.gensig.as_ptr() as *const c_void,
-                    &mut deadline,
-                    &mut offset,
-                );
-            } else {
-                let result = find_best_deadline_rust(
-                    &bs,
-                    (read_reply.info.len as u64) / 64,
-                    &*read_reply.info.gensig,
-                );
-                deadline = result.0;
-                offset = result.1;
-            }
-        }
-        #[cfg(feature = "neon")]
-        unsafe {
-            #[cfg(target_arch = "arm")]
-            let neon = is_arm_feature_detected!("neon");
-            #[cfg(target_arch = "aarch64")]
-            let neon = true;
-            if neon {
-                find_best_deadline_neon(
-                    bs.as_ptr() as *mut c_void,
-                    (read_reply.info.len as u64) / 64,
-                    read_reply.info.gensig.as_ptr() as *const c_void,
-                    &mut deadline,
-                    &mut offset,
-                );
-            } else {
-                let result = find_best_deadline_rust(
-                    &bs,
-                    (read_reply.info.len as u64) / 64,
-                    &*read_reply.info.gensig,
-                );
-                deadline = result.0;
-                offset = result.1;
-            }
-        }
-
-        #[cfg(not(any(feature = "simd", feature = "neon")))]
-        {
+    #[cfg(feature = "simd")]
+    unsafe {
+        if is_x86_feature_detected!("avx512f") {
+            find_best_deadline_avx512f(
+                bs.as_ptr() as *mut c_void,
+                (read_reply.info.len as u64) / 64,
+                read_reply.info.gensig.as_ptr() as *const c_void,
+                &mut deadline,
+                &mut offset,
+            );
+        } else if is_x86_feature_detected!("avx2") {
+            find_best_deadline_avx2(
+                bs.as_ptr() as *mut c_void,
+                (read_reply.info.len as u64) / 64,
+                read_reply.info.gensig.as_ptr() as *const c_void,
+                &mut deadline,
+                &mut offset,
+            );
+        } else if is_x86_feature_detected!("avx") {
+            find_best_deadline_avx(
+                bs.as_ptr() as *mut c_void,
+                (read_reply.info.len as u64) / 64,
+                read_reply.info.gensig.as_ptr() as *const c_void,
+                &mut deadline,
+                &mut offset,
+            );
+        } else if is_x86_feature_detected!("sse2") {
+            find_best_deadline_sse2(
+                bs.as_ptr() as *mut c_void,
+                (read_reply.info.len as u64) / 64,
+                read_reply.info.gensig.as_ptr() as *const c_void,
+                &mut deadline,
+                &mut offset,
+            );
+        } else {
             let result = find_best_deadline_rust(
                 &bs,
                 (read_reply.info.len as u64) / 64,
@@ -205,23 +167,59 @@ pub fn hash(
             deadline = result.0;
             offset = result.1;
         }
-
-        tx_nonce_data
-            .clone()
-            .send(NonceData {
-                height: read_reply.info.height,
-                block: read_reply.info.block,
-                base_target: read_reply.info.base_target,
-                deadline,
-                nonce: offset + read_reply.info.start_nonce,
-                reader_task_processed: read_reply.info.finished,
-                account_id: read_reply.info.account_id,
-            })
-            .now_or_never();
-        tx_empty_buffers
-            .send(buffer)
-            .expect("CPU worker failed to cue empty buffer");
     }
+    #[cfg(feature = "neon")]
+    unsafe {
+        #[cfg(target_arch = "arm")]
+        let neon = is_arm_feature_detected!("neon");
+        #[cfg(target_arch = "aarch64")]
+        let neon = true;
+        if neon {
+            find_best_deadline_neon(
+                bs.as_ptr() as *mut c_void,
+                (read_reply.info.len as u64) / 64,
+                read_reply.info.gensig.as_ptr() as *const c_void,
+                &mut deadline,
+                &mut offset,
+            );
+        } else {
+            let result = find_best_deadline_rust(
+                &bs,
+                (read_reply.info.len as u64) / 64,
+                &*read_reply.info.gensig,
+            );
+            deadline = result.0;
+            offset = result.1;
+        }
+    }
+
+    #[cfg(not(any(feature = "simd", feature = "neon")))]
+    {
+        let result = find_best_deadline_rust(
+            &bs,
+            (read_reply.info.len as u64) / 64,
+            &*read_reply.info.gensig,
+        );
+        deadline = result.0;
+        offset = result.1;
+    }
+
+    tx_nonce_data
+        .clone()
+        .send(NonceData {
+            height: read_reply.info.height,
+            block: read_reply.info.block,
+            base_target: read_reply.info.base_target,
+            deadline,
+            nonce: offset + read_reply.info.start_nonce,
+            reader_task_processed: read_reply.info.finished,
+            account_id: read_reply.info.account_id,
+        })
+        .await
+        .unwrap_or_else(|_| println!("CPU worker failed to send nonce data"));
+    tx_empty_buffers
+        .send(buffer)
+        .expect("CPU worker failed to cue empty buffer");
 }
 
 #[cfg(test)]

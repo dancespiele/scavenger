@@ -9,7 +9,8 @@ use std::cmp::{max, min};
 use std::ffi::CString;
 use std::process;
 use std::slice::from_raw_parts_mut;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 static SRC: &'static str = include_str!("ocl/kernel.cl");
 const SCOOP_SIZE: u64 = 64;

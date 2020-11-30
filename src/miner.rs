@@ -23,12 +23,12 @@ use std::collections::HashMap;
 use std::fs::read_dir;
 use std::path::PathBuf;
 use std::process;
-use std::sync::{Arc, Mutex};
-use std::thread;
+use std::sync::Arc;
 use std::time::Duration;
 use std::u64;
 use stopwatch::Stopwatch;
 use tokio::sync::mpsc;
+use tokio::sync::Mutex;
 use tokio::time;
 
 pub struct Miner {
@@ -164,7 +164,7 @@ impl Buffer for CpuBuffer {
     }
 }
 
-fn scan_plots(
+async fn scan_plots(
     plot_dirs: &[PathBuf],
     use_direct_io: bool,
     dummy: bool,
@@ -206,7 +206,7 @@ fn scan_plots(
         .drain()
         .map(|(drive_id, mut plots)| {
             plots.sort_by_key(|p| {
-                let m = p.lock().unwrap().fh.metadata().unwrap();
+                let m = p.lock().await.fh.metadata().unwrap();
                 -FileTime::from_last_modification_time(&m).unix_seconds()
             });
             (drive_id, Arc::new(plots))
@@ -225,7 +225,7 @@ fn scan_plots(
 impl Miner {
     pub async fn new(cfg: Cfg) -> Miner {
         let (drive_id_to_plots, total_size) =
-            scan_plots(&cfg.plot_dirs, cfg.hdd_use_direct_io, cfg.benchmark_cpu());
+            scan_plots(&cfg.plot_dirs, cfg.hdd_use_direct_io, cfg.benchmark_cpu()).await;
 
         let cpu_threads = cfg.cpu_threads;
         let cpu_worker_task_count = cfg.cpu_worker_task_count;
@@ -372,10 +372,9 @@ impl Miner {
 
         let (tx_nonce_data, rx_nonce_data) = mpsc::channel(buffer_count);
 
-        thread::spawn({
+        tokio::spawn({
             create_cpu_worker_task(
                 cfg.benchmark_io(),
-                new_thread_pool(cpu_threads, cfg.cpu_thread_pinning),
                 rx_read_replies_cpu.clone(),
                 tx_empty_buffers.clone(),
                 tx_nonce_data.clone(),
@@ -439,7 +438,8 @@ impl Miner {
                 (total_size * 4 / 1024 / 1024) as usize,
                 cfg.send_proxy_details,
                 cfg.additional_headers,
-            ).await,
+            )
+            .await,
             state: Arc::new(Mutex::new(State::new())),
             // floor at 1s to protect servers
             get_mining_info_interval: max(1000, cfg.get_mining_info_interval),
@@ -459,62 +459,62 @@ impl Miner {
         // there might be a way to solve this without two nested moves
         let get_mining_info_interval = self.get_mining_info_interval;
         let wakeup_after = self.wakeup_after.clone();
-        tokio::spawn(async move{
+        tokio::spawn(async move {
             loop {
-                let mut interval= time::interval(Duration::from_millis(get_mining_info_interval));
-            let state = state.clone();
-            let reader = reader.clone();
-            let mining_info = request_handler.get_mining_info().await;
-            match mining_info {
-                Ok(mining_info) => {
-                    let mut state = state.lock().unwrap();
-                    state.first = false;
-                    if state.outage {
-                        error!("{: <80}", "outage resolved.");
-                        state.outage = false;
-                    }
-                    if mining_info.generation_signature != state.generation_signature {
-                        state.update_mining_info(&mining_info);
-
-                        reader.lock().unwrap().start_reading(
-                            mining_info.height,
-                            state.block,
-                            mining_info.base_target,
-                            state.scoop,
-                            &Arc::new(state.generation_signature_bytes),
-                        );
-                        drop(state);
-                    } else if !state.scanning
-                        && wakeup_after != 0
-                        && state.sw.elapsed_ms() > wakeup_after
-                    {
-                        info!("HDD, wakeup!");
-                        reader.lock().unwrap().wakeup();
-                        state.sw.restart();
-                    }
-                }
-                _ => {
-                    let mut state = state.lock().unwrap();
-                    if state.first {
-                        error!(
-                            "{: <80}",
-                            "error getting mining info, please check server config"
-                        );
+                let mut interval = time::interval(Duration::from_millis(get_mining_info_interval));
+                let state = state.clone();
+                let reader = reader.clone();
+                let mining_info = request_handler.get_mining_info().await;
+                match mining_info {
+                    Ok(mining_info) => {
+                        let mut state = state.lock().await;
                         state.first = false;
-                        state.outage = true;
-                    } else {
-                        if !state.outage {
+                        if state.outage {
+                            error!("{: <80}", "outage resolved.");
+                            state.outage = false;
+                        }
+                        if mining_info.generation_signature != state.generation_signature {
+                            state.update_mining_info(&mining_info);
+
+                            reader.lock().await.start_reading(
+                                mining_info.height,
+                                state.block,
+                                mining_info.base_target,
+                                state.scoop,
+                                &Arc::new(state.generation_signature_bytes),
+                            );
+                            drop(state);
+                        } else if !state.scanning
+                            && wakeup_after != 0
+                            && state.sw.elapsed_ms() > wakeup_after
+                        {
+                            info!("HDD, wakeup!");
+                            reader.lock().await.wakeup();
+                            state.sw.restart();
+                        }
+                    }
+                    _ => {
+                        let mut state = state.lock().await;
+                        if state.first {
                             error!(
                                 "{: <80}",
-                                "error getting mining info => connection outage..."
+                                "error getting mining info, please check server config"
                             );
+                            state.first = false;
+                            state.outage = true;
+                        } else {
+                            if !state.outage {
+                                error!(
+                                    "{: <80}",
+                                    "error getting mining info => connection outage..."
+                                );
+                            }
+                            state.outage = true;
                         }
-                        state.outage = true;
                     }
                 }
-            }
 
-            interval.tick().await;
+                interval.tick().await;
             }
         });
 
@@ -524,9 +524,9 @@ impl Miner {
         let state = self.state.clone();
         let reader_task_count = self.reader_task_count.clone();
         let mut rx_nonce_data = self.rx_nonce_data;
-        tokio::spawn( async move {
+        tokio::spawn(async move {
             let nonce_data = rx_nonce_data.recv().await.unwrap();
-            let mut state = state.lock().unwrap();
+            let mut state = state.lock().await;
             let deadline = nonce_data.deadline / nonce_data.base_target;
             if state.height == nonce_data.height {
                 let best_deadline = *state
